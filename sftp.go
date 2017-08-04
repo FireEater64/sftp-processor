@@ -1,8 +1,8 @@
 package sftp
 
 import (
+	"errors"
 	"io/ioutil"
-	"time"
 
 	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/mail"
@@ -20,18 +20,95 @@ type sftpConfig struct {
 	Path     string `json:"sftp_path,omitempty"`
 }
 
-var config *sftpConfig
-var sshClient *ssh.Client // TODO: Could worker share a SSH connection?
-var sftpClient *sftp.Client
+var publisher *Publisher
+var sshClient *ssh.Client
 
-func parsePrivateKeyIfExists() (ssh.Signer, error) {
+// Publisher wraps an SSH connection, and provides methods for saving
+// email messages using SFTP
+type Publisher struct {
+	sshClient *ssh.Client
+	path      string
+}
+
+// New returns a new SftpPublisher, which uses the given ssh.Client
+func New(client *ssh.Client, path string) *Publisher {
+	return &Publisher{sshClient: client, path: path}
+}
+
+// SaveMessage transfers the given message to the configured SFTP share, then
+// writes a '.done' file to signify the end of a successful transfer
+func (p *Publisher) SaveMessage(emailHash string, data []byte) error {
+
+	sftpClient, err := p.getSftpClient()
+	if err != nil {
+		return err
+	}
+
+	defer sftpClient.Close()
+
+	// Create email file
+	dataFileName := sftpClient.Join(p.path, emailHash+".eml")
+	dataFile, err := sftpClient.Create(dataFileName)
+
+	if err != nil {
+		return err
+	}
+
+	// Write to the file
+	bytesWritten, err := dataFile.Write(data)
+	if err != nil {
+		return err
+	}
+
+	if bytesWritten != len(data) {
+		return errors.New("Corrupt upload")
+	}
+
+	err = dataFile.Close()
+	if err != nil {
+		return nil
+	}
+
+	// Write the .done file
+	doneFileName := dataFileName + ".done"
+	doneFile, err := sftpClient.Create(doneFileName)
+	if err != nil {
+		return err
+	}
+
+	err = doneFile.Close()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Close the underlying clients, and exit gracefully
+func (p *Publisher) Close() error {
+	if p.sshClient != nil {
+		err := p.sshClient.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	p.sshClient = nil
+	return nil
+}
+
+func (p *Publisher) getSftpClient() (*sftp.Client, error) {
+	return sftp.NewClient(p.sshClient)
+}
+
+func parsePrivateKeyIfExists(keyFile string, keyPass string) (ssh.Signer, error) {
 	// Check for/parse private key
-	if config.KeyFile != "" {
-		fileContents, err := ioutil.ReadFile(config.KeyFile)
+	if keyFile != "" {
+		fileContents, err := ioutil.ReadFile(keyFile)
 		if err != nil {
 			return nil, err
 		}
-		privateKey, err := ssh.ParsePrivateKeyWithPassphrase(fileContents, []byte(config.KeyPass))
+		privateKey, err := ssh.ParsePrivateKeyWithPassphrase(fileContents, []byte(keyPass))
 		if err != nil {
 			return nil, err
 		}
@@ -42,6 +119,7 @@ func parsePrivateKeyIfExists() (ssh.Signer, error) {
 	return nil, nil
 }
 
+// SFTPProcessor is the main decorator, to be registered with the Guerilla daemon
 var SFTPProcessor = func() backends.Decorator {
 	// Establish an SSH connection when the server starts
 
@@ -58,7 +136,7 @@ var SFTPProcessor = func() backends.Decorator {
 			return err
 		}
 
-		config = parsedConfig.(*sftpConfig)
+		config := parsedConfig.(*sftpConfig)
 
 		// Establish an SSH connection
 		sshConfig := &ssh.ClientConfig{
@@ -71,7 +149,7 @@ var SFTPProcessor = func() backends.Decorator {
 		}
 
 		// Parse SSH keys
-		signers, err := parsePrivateKeyIfExists()
+		signers, err := parsePrivateKeyIfExists(config.KeyFile, config.KeyPass)
 		if err != nil {
 			return err
 		}
@@ -79,33 +157,18 @@ var SFTPProcessor = func() backends.Decorator {
 			sshConfig.Auth = append(sshConfig.Auth, ssh.PublicKeys(signers))
 		}
 
-		sshClient, err = ssh.Dial("tcp", config.Hostname, sshConfig)
+		if sshClient == nil {
+			sshClient, err = ssh.Dial("tcp", config.Hostname, sshConfig)
 
-		if err != nil {
-			print(err.Error())
-			return err
+			if err != nil {
+				print(err.Error())
+				return err
+			}
 		}
 
-		// Setup keepalive for SSH
-		go func() {
-			t := time.NewTicker(30 * time.Second)
-			defer t.Stop()
-
-			for {
-				<-t.C
-				_, _, err := sshClient.Conn.SendRequest("keepalive@golang.org", true, nil)
-				if err != nil {
-					backends.Log().Warnf("Disconnected from server: %s. Attempting to reconnect", err.Error())
-					sshClient, err = ssh.Dial("tcp", config.Hostname, sshConfig)
-					if err != nil {
-						backends.Log().Fatalf("Error whilst attempting to reconnect to server: %s", err.Error)
-					}
-				}
-			}
-		}()
-
-		// Now establish an SFTP connection over the SSH tunnel
-		sftpClient, err = sftp.NewClient(sshClient)
+		if publisher == nil {
+			publisher = New(sshClient, config.Path)
+		}
 
 		if err != nil {
 			print(err)
@@ -120,10 +183,7 @@ var SFTPProcessor = func() backends.Decorator {
 
 	// Cleanly shutdown SFTP connection when stopping
 	backends.Svc.AddShutdowner(backends.ShutdownWith(func() error {
-		if sftpClient != nil {
-			return sftpClient.Close()
-		}
-		return nil
+		return publisher.Close()
 	}))
 
 	return func(p backends.Processor) backends.Processor {
@@ -140,44 +200,15 @@ var SFTPProcessor = func() backends.Decorator {
 
 					e.QueuedId = e.Hashes[0]
 					hash := e.Hashes[0]
-					dataFileName := sftpClient.Join(config.Path, hash+".eml")
-					doneFileName := dataFileName + ".done"
 
-					// Create email file
-					dataFile, err := sftpClient.Create(dataFileName)
+					err := publisher.SaveMessage(hash, e.Data.Bytes())
 
 					if err != nil {
 						backends.Log().WithError(err).Error("Could not upload file")
 						return backends.NewResult(response.Canned.ErrorRelayDenied), backends.StorageError
 					}
 
-					// Write to the file
-					_, err = dataFile.Write(e.Data.Bytes())
-					if err != nil {
-						backends.Log().WithError(err).Error("Error whilst uploading file")
-						return backends.NewResult(response.Canned.ErrorRelayDenied), backends.StorageError
-					}
-
-					err = dataFile.Close()
-					if err != nil {
-						backends.Log().WithError(err).Error("Error whilst closing data file")
-						return backends.NewResult(response.Canned.ErrorRelayDenied), backends.StorageError
-					}
-
-					// Now write the done file
-					doneFile, err := sftpClient.Create(doneFileName)
-					if err != nil {
-						backends.Log().WithError(err).Error("Error whilst touching done file")
-						return backends.NewResult(response.Canned.ErrorRelayDenied), backends.StorageError
-					}
-
-					err = doneFile.Close()
-					if err != nil {
-						backends.Log().WithError(err).Error("Error whilst closing data file")
-						return backends.NewResult(response.Canned.ErrorRelayDenied), backends.StorageError
-					}
-
-					backends.Log().Info("Message delivered to %s", dataFileName)
+					backends.Log().Info("%s delivered", hash)
 
 					return p.Process(e, task)
 				}
