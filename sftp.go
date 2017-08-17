@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"io/ioutil"
+	"time"
 
 	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/mail"
@@ -84,6 +85,24 @@ var SFTPProcessor = func() backends.Decorator {
 			print(err.Error())
 			return err
 		}
+
+		// Setup keepalive for SSH
+		go func() {
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+
+			for {
+				<-t.C
+				_, _, err := sshClient.Conn.SendRequest("keepalive@golang.org", true, nil)
+				if err != nil {
+					backends.Log().Warnf("Disconnected from server: %s. Attempting to reconnect", err.Error())
+					sshClient, err = ssh.Dial("tcp", config.Hostname, sshConfig)
+					if err != nil {
+						backends.Log().Fatalf("Error whilst attempting to reconnect to server: %s", err.Error)
+					}
+				}
+			}
+		}()
 
 		// Now establish an SFTP connection over the SSH tunnel
 		sftpClient, err = sftp.NewClient(sshClient)
