@@ -3,6 +3,7 @@ package sftp
 import (
 	"errors"
 	"io/ioutil"
+	"time"
 
 	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/mail"
@@ -20,35 +21,59 @@ type sftpConfig struct {
 	Path     string `json:"sftp_path,omitempty"`
 }
 
-var publisher *Publisher
-var sshClient *ssh.Client
-
 // Publisher wraps an SSH connection, and provides methods for saving
 // email messages using SFTP
 type Publisher struct {
-	sshClient *ssh.Client
-	path      string
+	hostname   string
+	sshConfig  *ssh.ClientConfig
+	sshClient  *ssh.Client
+	sftpClient *sftp.Client
+	path       string
 }
 
 // New returns a new SftpPublisher, which uses the given ssh.Client
-func New(client *ssh.Client, path string) *Publisher {
-	return &Publisher{sshClient: client, path: path}
+func New(hostname string, sshConfig *ssh.ClientConfig, path string) (*Publisher, error) {
+	toReturn := &Publisher{hostname: hostname, sshConfig: sshConfig, path: path}
+	err := toReturn.Connect()
+	return toReturn, err
+}
+
+// Connect establishes a connection using the given credentials
+func (p *Publisher) Connect() error {
+
+	var err error
+	p.sshClient, err = p.getSSHClient()
+
+	if err != nil {
+		return err
+	}
+
+	p.sftpClient, err = p.getSFTPClient()
+
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+
+		for {
+			<-t.C
+			p.doHealthCheck()
+		}
+	}()
+
+	return nil
 }
 
 // SaveMessage transfers the given message to the configured SFTP share, then
 // writes a '.done' file to signify the end of a successful transfer
 func (p *Publisher) SaveMessage(emailHash string, data []byte) error {
 
-	sftpClient, err := p.getSftpClient()
-	if err != nil {
-		return err
-	}
-
-	defer sftpClient.Close()
-
 	// Create email file
-	dataFileName := sftpClient.Join(p.path, emailHash+".eml")
-	dataFile, err := sftpClient.Create(dataFileName)
+	dataFileName := p.sftpClient.Join(p.path, emailHash+".eml")
+	dataFile, err := p.sftpClient.Create(dataFileName)
 
 	if err != nil {
 		return err
@@ -71,7 +96,7 @@ func (p *Publisher) SaveMessage(emailHash string, data []byte) error {
 
 	// Write the .done file
 	doneFileName := dataFileName + ".done"
-	doneFile, err := sftpClient.Create(doneFileName)
+	doneFile, err := p.sftpClient.Create(doneFileName)
 	if err != nil {
 		return err
 	}
@@ -97,7 +122,39 @@ func (p *Publisher) Close() error {
 	return nil
 }
 
-func (p *Publisher) getSftpClient() (*sftp.Client, error) {
+func (p *Publisher) doHealthCheck() error {
+	backends.Log().Debugln("Sending keepalive")
+
+	// Check SSH connection health
+	_, _, err := p.sshClient.Conn.SendRequest("keepalive@golang.org", true, nil)
+	if err != nil {
+		backends.Log().Warnf("Disconnected from server: %s. Attempting to reconnect", err.Error())
+		p.sshClient, err = p.getSSHClient()
+		if err != nil {
+			backends.Log().Fatalf("Error whilst attempting to reconnect to server: %s", err.Error())
+			return err
+		}
+	}
+
+	// Check SFTP client health
+	_, err = p.sftpClient.Getwd()
+	if err != nil {
+		backends.Log().Warnf("SFTP client broken: %s. Attempting to reconnect", err.Error())
+		p.sftpClient, err = p.getSFTPClient()
+		if err != nil {
+			backends.Log().Fatalf("Error whilst attempting to re-establish SFTP client: %s", err.Error())
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *Publisher) getSSHClient() (*ssh.Client, error) {
+	return ssh.Dial("tcp", p.hostname, p.sshConfig)
+}
+
+func (p *Publisher) getSFTPClient() (*sftp.Client, error) {
 	return sftp.NewClient(p.sshClient)
 }
 
@@ -121,7 +178,7 @@ func parsePrivateKeyIfExists(keyFile string, keyPass string) (ssh.Signer, error)
 
 // SFTPProcessor is the main decorator, to be registered with the Guerilla daemon
 var SFTPProcessor = func() backends.Decorator {
-	// Establish an SSH connection when the server starts
+	var publisher *Publisher
 
 	// Config to be populated by initFunc
 	initializer := backends.InitializeWith(func(backendConfig backends.BackendConfig) error {
@@ -132,7 +189,7 @@ var SFTPProcessor = func() backends.Decorator {
 		parsedConfig, err := backends.Svc.ExtractConfig(backendConfig, configType)
 
 		if err != nil {
-			print(err)
+			backends.Log().Fatalln(err)
 			return err
 		}
 
@@ -157,17 +214,11 @@ var SFTPProcessor = func() backends.Decorator {
 			sshConfig.Auth = append(sshConfig.Auth, ssh.PublicKeys(signers))
 		}
 
-		if sshClient == nil {
-			sshClient, err = ssh.Dial("tcp", config.Hostname, sshConfig)
-
+		if publisher == nil {
+			publisher, err = New(config.Hostname, sshConfig, config.Path)
 			if err != nil {
-				print(err.Error())
 				return err
 			}
-		}
-
-		if publisher == nil {
-			publisher = New(sshClient, config.Path)
 		}
 
 		if err != nil {
