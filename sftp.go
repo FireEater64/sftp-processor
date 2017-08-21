@@ -21,8 +21,6 @@ type sftpConfig struct {
 }
 
 var config *sftpConfig
-var sshClient *ssh.Client // TODO: Could worker share a SSH connection?
-var sftpClient *sftp.Client
 
 func parsePrivateKeyIfExists() (ssh.Signer, error) {
 	// Check for/parse private key
@@ -43,6 +41,10 @@ func parsePrivateKeyIfExists() (ssh.Signer, error) {
 }
 
 var SFTPProcessor = func() backends.Decorator {
+
+	var sshClient *ssh.Client
+	var sftpClient *sftp.Client
+
 	// Establish an SSH connection when the server starts
 
 	// Config to be populated by initFunc
@@ -54,7 +56,7 @@ var SFTPProcessor = func() backends.Decorator {
 		parsedConfig, err := backends.Svc.ExtractConfig(backendConfig, configType)
 
 		if err != nil {
-			print(err)
+			backends.Log().Fatal(err)
 			return err
 		}
 
@@ -82,7 +84,15 @@ var SFTPProcessor = func() backends.Decorator {
 		sshClient, err = ssh.Dial("tcp", config.Hostname, sshConfig)
 
 		if err != nil {
-			print(err.Error())
+			backends.Log().Fatal(err.Error())
+			return err
+		}
+
+		// Now establish an SFTP connection over the SSH tunnel
+		sftpClient, err = sftp.NewClient(sshClient)
+
+		if err != nil {
+			backends.Log().Fatal(err.Error())
 			return err
 		}
 
@@ -93,24 +103,31 @@ var SFTPProcessor = func() backends.Decorator {
 
 			for {
 				<-t.C
+				backends.Log().Debugln("Sending keepalive")
+
+				// Check SSH connection health
 				_, _, err := sshClient.Conn.SendRequest("keepalive@golang.org", true, nil)
 				if err != nil {
 					backends.Log().Warnf("Disconnected from server: %s. Attempting to reconnect", err.Error())
 					sshClient, err = ssh.Dial("tcp", config.Hostname, sshConfig)
 					if err != nil {
-						backends.Log().Fatalf("Error whilst attempting to reconnect to server: %s", err.Error)
+						backends.Log().Fatalf("Error whilst attempting to reconnect to server: %s", err.Error())
+						continue
+					}
+				}
+
+				// Check SFTP client health
+				_, err = sftpClient.Getwd()
+				if err != nil {
+					backends.Log().Warnf("SFTP client broken: %s. Attempting to reconnect", err.Error())
+					sftpClient, err = sftp.NewClient(sshClient)
+					if err != nil {
+						backends.Log().Fatalf("Error whilst attempting to re-establish SFTP client: %s", err.Error())
+						continue
 					}
 				}
 			}
 		}()
-
-		// Now establish an SFTP connection over the SSH tunnel
-		sftpClient, err = sftp.NewClient(sshClient)
-
-		if err != nil {
-			print(err)
-			return err
-		}
 
 		return nil
 	})
