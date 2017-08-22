@@ -194,7 +194,7 @@ var SFTPProcessor = func() backends.Decorator {
 						return backends.NewResult(response.Canned.ErrorRelayDenied), backends.StorageError
 					}
 
-					backends.Log().Info("Message delivered to %s", dataFileName)
+					backends.Log().Infof("Message delivered to %s", dataFileName)
 
 					return p.Process(e, task)
 				}
